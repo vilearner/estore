@@ -1,0 +1,177 @@
+pipeline {
+  agent { 
+    node { label 'maven' }      
+ }
+  environment {
+    def readContent = readJSON file: './devops/env.json'
+    componentName = "${readContent['component_name']}"
+    projectName = "${namespace}"
+    PORT = "${readContent['tcp_port']}"
+    databaseName = "postgresql";
+    databaseTemplate = "postgresql-persistent-ref-impl-2-1";
+    DatabaseRollout= "true";
+    DatabaseSwitch="false";	 
+    database = "estore";
+    databaseuser= "estore";
+    databasepassword= "welcome2ibm";	    
+    ApplicationForceRollout="false"; // In this case trigeer should be diabled in application deployment configuration 
+    releaseTag = "qa";
+    buildTag = "Build-${BUILD_NUMBER}"
+    latestTag = "latest";
+    expSqdTag = "ibm-enablement";
+    language = "java";
+    projectkey = "testkey"; 	  
+    binaryArtifact = readMavenPom().getArtifactId()
+    binaryArtifactId = readMavenPom().getVersion()  
+	  
+  } 
+  
+  stages {
+ 
+stage('Build App') { 
+  
+     steps {
+       script{      
+       sh "mvn install -DskipTests=true"
+       }
+      }
+    }
+
+	  
+stage('Code Analysis') {
+   steps {
+         withSonarQubeEnv('sonarscanner') {
+           sh 'mvn org.sonarsource.scanner.maven:sonar-maven-plugin:3.3.0.603:sonar -f pom.xml -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.login=$SONAR_AUTH_TOKEN -Dsonar.projectKey="$projectkey" -Dsonar.language=$language -Dsonar.sources=. -Dsonar.java.binaries=target/classes -Dsonar.tests=. -Dsonar.test.inclusions=**/*Test*/* -Dsonar.exclusions=target/**/*.class'
+  }
+      }
+
+    } 
+  
+   stage('Create Image') {
+      steps {
+        script {
+          openshift.withCluster() {
+              openshift.withProject("${env.projectName}") {
+	      def bcExists = openshift.selector("bc", "${env.componentName}").exists()
+              if ( !bcExists) {
+                  echo "No BuildConfig found. Creating ..."
+                  sh "oc new-build --name=${env.componentName} --binary --strategy=docker --to=${env.projectName}/${env.componentName}:${env.latestTag} -n ${env.projectName}"
+		  echo "oc new-build ${env.builderImage} --name=${env.componentName} --binary=true --to=${env.projectName}/${env.componentName}:${env.latestTag} -n ${env.projectName}"    
+            } else {
+              echo "Found BuildConfig ${env.componentName}"
+            }
+			  
+			  
+	      def bc = openshift.selector("bc", "${env.componentName}")
+              echo "Pusing binday image ..."
+	      sh "ls -ltr ."	      
+	      sh "oc start-build ${env.componentName} --from-dir=. --follow  -n ${env.projectName}"
+	       timeout(2) {   
+                        bc.related('builds').untilEach(1) {
+                      return (it.object().status.phase == "Complete")
+                    }
+		      }	  
+              echo "Image tagging ..."
+              openshift.tag("${env.componentName}:${env.latestTag}", "${env.componentName}:${env.buildTag}")
+	      openshift.selector("istag", "${env.componentName}:${env.latestTag}").delete()
+              openshift.tag("${env.componentName}:${env.buildTag}", "${env.componentName}:${env.latestTag}")
+                  
+              }
+          }
+         }
+      }
+    }
+
+
+	  
+stage('Deploy DB') {
+      steps {
+       script {
+        openshift.withCluster() {
+            openshift.withProject("${env.projectName}") {
+		    
+	      //Database Deployment 	    
+              if ( openshift.selector("dc", "${env.databaseName}").exists()) {
+			  
+		              echo "${env.databaseName} database is already deployed."
+		              if ( "${env.DatabaseRollout}" == "${env.DatabaseSwitch}" ) {
+			                 echo "As Database rollout is set true. Rolling out ..."
+			                 def rm = openshift.selector("dc", "${env.databaseName}").rollout().latest()
+                       timeout(5) { 
+                         openshift.selector("dc", "${env.databaseName}").related('pods').untilEach(1) {
+                         return (it.object().status.phase == "Running")
+                         }
+                       } 
+		              }
+			        } 
+              else {
+                 echo "${env.databaseName} Database is not deployed. Deploying ..."
+		      // Following hardcoding of userid/pass to be removed post estore app folks fix the same in app
+		      def db = openshift.newApp("--template=${env.databaseTemplate}","--param=POSTGRESQL_USER=${env.databaseuser}","--param=POSTGRESQL_PASSWORD=${env.databasepassword}","--param=POSTGRESQL_DATABASE=${env.database}")
+                def dbdc = openshift.selector("dc", "${env.databaseName}")
+                while (dbdc.object().spec.replicas != dbdc.object().status.availableReplicas) {
+                sleep 10
+		          
+			          }
+              	echo "PostgreSQL deployed and application database initialized."
+		      
+		          }     
+	        }
+	    }
+    }
+  }
+}
+
+stage('Deploy Application') {
+      steps {
+       script {
+        openshift.withCluster() {
+          openshift.withProject("${env.projectName}") {    
+		      
+          //Application Deployment    
+	        
+          if ( openshift.selector("dc", "${env.componentName}").exists()) {
+		          echo " ${env.componentName} is already deployed. Performing rolling update ..."
+		          if ( "${env.ApplicationForceRollout}" == "true" ) {
+		              def rm = openshift.selector("dc", "${env.componentName}").rollout().latest()
+                  timeout(10) { 
+                    openshift.selector("dc", "${env.componentName}").related('pods').untilEach(1) {
+                      return (it.object().status.phase == "Running")
+			              }	
+                  }
+              }  
+		      }
+          else {   
+              def app = openshift.newApp("${env.projectName}/${env.componentName}")
+              def appdc = openshift.selector("dc", "${env.componentName}")
+              while (appdc.object().spec.replicas != appdc.object().status.availableReplicas) {
+                  sleep 10	
+              }
+	      openshift.create( "route", "edge", "--insecure-policy Redirect", "--service=${env.componentName}" )	 
+              echo "Application deployed"  
+          } 
+        } 
+	      }
+    	}
+    }
+  }
+  
+  
+    stage('Tag Image') {
+      steps {
+        script {
+          openshift.withCluster() {
+          openshift.withProject("${env.projectName}"){
+           openshift.tag("${env.componentName}:${env.buildTag}", "${env.componentName}:${env.releaseTag}")
+           openshift.tag("${env.componentName}:${env.releaseTag}", "${env.componentName}:${env.expSqdTag}", "--alias")
+	
+         }
+       }
+     }
+    }
+   }
+  
+}
+	       
+    
+}

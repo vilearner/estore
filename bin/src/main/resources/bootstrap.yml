@@ -1,0 +1,40 @@
+spring:  
+  application:
+    name: inventoryservice
+  profiles:
+    active: development
+  
+ 
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    initialization-mode: always
+    url: jdbc:postgresql://postgresql:5432/inventorydb
+    username: invuser
+    password: invpwd
+
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: true
+    database: postgresql
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    open-in-view: false
+    generate-ddl: false
+    
+
+  
+management:
+  endpoint:
+    metrics:
+      enabled: true
+    prometheus:
+      enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+  
